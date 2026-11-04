@@ -1,0 +1,30 @@
+# 민감 정보 - AI 접근 차단
+# 환경 변수
+.env
+.env.*
+**/.env
+**/.env.*
+
+# sqlboiler 설정 (DB 접속 정보 포함)
+sqlboiler.toml
+**/sqlboiler.toml
+sqlboiler_*.toml
+**/sqlboiler_*.toml
+
+# 노이즈 - 토큰 낭비 방지
+# 로그
+logs/
+**/logs/
+*.log
+
+# 의존성
+node_modules/
+**/node_modules/
+
+# Go 빌드 산출물 / 벤더
+vendor/
+**/vendor/
+
+# 기타
+.DS_Store
+**/.DS_Store
