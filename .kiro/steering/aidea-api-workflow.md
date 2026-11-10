@@ -53,11 +53,12 @@ config/
 router/
   index.go           # 최상위 Router(): /, /health, auth 미들웨어 + workflow 라우트 연결
   workflow/
-    index.go         # 라우트 트리 + 서비스 init (workflowService/argoService/kubeService)
-    workflow.go      # Workflow/Task CRUD 핸들러
-    run.go           # Run/RunTask 핸들러 (createRun/getRun/finishRun/getRunTask/updateRunTask)
-service/
-  workflow/service.go   # SQLBoiler 기반 DB 접근 계층 (읽기/쓰기 DB 분리)
+    index.go         # 라우트 트리 + 의존성 조립(store/argo/kube) + api 구조체 정의 + &api{...} 생성
+    workflow.go      # Workflow/Task CRUD 핸들러 ((a *api) 메서드)
+    run.go           # Run/RunTask 핸들러 ((a *api) 메서드: createRun/getRun/finishRun/getRunTask/updateRunTask)
+store/
+  workflow.go           # SQLBoiler 기반 DB 접근 계층 (package store, type Workflow, 읽기/쓰기 DB 분리)
+service/                # 외부 시스템 연동 서비스만 남김 (DB 접근 아님)
   argo/                 # builder.go(DAG 빌드) + index.go(Service: Argo client, RunWorkflow)
   kubernetes/           # index.go, pod.go, secret.go — client-go Pod/Secret 유틸 (+ pod_test.go)
 database/            # SQLBoiler 생성 코드 — 직접 수정 금지
@@ -102,10 +103,11 @@ Jenkinsfile          # amd64/arm64 멀티아치 빌드 + ArgoCD(GitOps) 배포
 ## 코딩 관례
 
 ### 파일 네이밍 / DI
-- `index.go` — 패키지 진입/배선. 패키지 `init()`, 공유 var, `Router(...)`/`NewService(...)`를 담는다.
-- **패키지 레벨 싱글톤 + 패키지별 `init()` 배선**. `router/workflow/index.go`의 `init()`이 `workflowService`/`argoService`/`kubeService`를 생성, 실패 시 `log.Panic`/`log.Fatal`.
+- `index.go` — 패키지 진입/배선. `Router(...)` 셋업 함수와 `router/workflow`의 `api` 구조체 정의를 담는다.
 - `config/index.go`가 `ENV`(기본 `local`)로 YAML + 루트 `.env` 로드, `cfg.Get()` 싱글톤. `init()`은 `hexim.LoadEnv()` 호출.
-- 서비스 생성자: `workflow.NewService(apiConfig, db, readDb *sql.DB)` — 쓰기(`anxer`)/읽기(`anxer_ro`) 커넥션 분리.
+- **DB 접근 계층은 `store` 패키지(`type Workflow`)**: `store.NewWorkflow(db, readDb *sql.DB)` — 쓰기(`anxer`)/읽기(`anxer_ro`) 커넥션 분리. (이전 `service/workflow`의 `NewService`/`Service`에서 리네임 — DB만 다루므로 "service"가 아니라 store. aidea-api-agent의 `store.Agent`와 동일 패턴.)
+- `service/argo`, `service/kubernetes`는 Argo/k8s client를 다루는 **진짜 서비스**라 `service/`에 그대로 둔다(생성자는 `argo.NewService`/`kubernetes.NewService`).
+- **핸들러 DI는 구조체 방식**: `router/workflow`의 모든 핸들러(workflow.go + run.go)는 `api` 구조체의 메서드다 — `type api struct { workflowStore *store.Workflow; kubeService *kubernetes.Service; argoService *argo.Service }`, 리시버 `(a *api)`. `Router()`가 store/argo/kube를 조립해 `a := &api{...}`로 직접 생성(재사용 없어 `NewAPI` 생성자는 두지 않음)하고, 라우트를 `a.getRun` 식으로 등록한다. 구조체명은 `api`(소문자 비공개) — Fiber의 `Group(prefix, handlers ...any)` 미들웨어 인자 `handlers`와 겹치지 않도록. (과거 `init()` 싱글톤 + 패키지 전역 `workflowService` var 배선은 제거됨. 단 store/argo/kube 조립이 아직 `Router()` 안에 있어, 완전한 composition root(`main` 주입)로는 추가 전환 여지가 있다.)
 
 ### 에러 처리
 - `hexim/errors`를 별칭 `er`로 사용. 전파 `er.Wrap(err)`, 생성 `er.New("msg", er.WithCode(http.StatusBadRequest))`, 검사 `er.Is`, 필드 `er.WithKeyValue(...)`.

@@ -13,12 +13,12 @@ fileMatchPattern: 'aidea-api-agent/{agent,cmd/workflow,cmd/agent,router/agent}/*
 
 | 항목 | API `invoke` (`router/agent/run.go`) | agent CLI (`cmd/agent/service.go`) | workflow CLI (`cmd/workflow/service.go`) |
 |---|---|---|---|
-| 조립 | `Orchestrator` 플래그면 Coordinator, 아니면 단일 Runner | 단일 Runner 고정 | **2계층 Coordinator (아래 참고)** |
+| 조립 | 단일 Runner (Worker + 조건부 Verifier) 고정 | 단일 Runner 고정 | **2계층 Coordinator (아래 참고)** |
 | `Input.Upstreams` | ✗ 미전달 | ✗ 미전달 | ✓ `Load()`로 선행 task 결과 |
 | `Input.RunInput` | ✗ 미전달 (`Input{Task, Goal}`만) | ✗ 미전달 | ✓ `s.run.UserInput` |
-| 결과 저장 | `agentService.SetRun` 직접 DB | `agent` API `/-/run` 호출 | `agent` API `/-/run` + output 파일 |
+| 결과 저장 | `agentStore.SetRun` 직접 DB | `agent` API `/-/run` 호출 | `agent` API `/-/run` + output 파일 |
 
-> `router/agent/run.go`(API invoke)와 `cmd/agent`는 아직 단층 구조이고 위 표의 미해결 항목(Upstreams/RunInput 미전달, 모델/파라미터 하드코딩, 최종 Verifier 주석 처리)이 남아 있다. 2계층 구조는 **`cmd/workflow/service.go`에만 적용**됐다.
+> **API invoke는 의도적으로 단일 Runner만 돈다.** 과거 `request.Orchestrator` 플래그로 Coordinator를 태우던 분기가 있었으나 제거했다 — 2계층 오케스트레이션은 (a) 즉석 동기 HTTP 요청엔 비용이 과하고(이중 Aggregate 등), (b) invoke는 단계 의존/upstream이 없어 stage 레이어가 빌 수밖에 없으며, (c) 호출자가 전략 적합성을 판단할 근거가 없기 때문. `cmd/agent`도 단일 Runner. **2계층 구조는 `cmd/workflow/service.go`에만 적용**된다. 오케스트레이션을 다른 진입점에도 열려면 요청 플래그가 아니라 **에이전트 버전 설정**으로 받는 방향이 맞다(남은 과제).
 
 ## 왜 2계층인가 — 문제와 설계
 
@@ -64,7 +64,7 @@ fileMatchPattern: 'aidea-api-agent/{agent,cmd/workflow,cmd/agent,router/agent}/*
 - 참고: `worker/runner/verifier/coordinator`의 start/done timer 로그는 `hexim.NewTimer`(공용 라이브러리) 소관이라 agent 쪽에서 끌 수 없다.
 
 ## 확인된 회귀 / 즉시 확인이 필요한 것
-- **API invoke가 순차로 돈다 (코드로 확인됨).** `router/agent/run.go`의 Coordinator는 `MaxParallel: 3`만 지정하고 `Parallel`을 지정하지 않는다. `CoordinatorConfig.Parallel` 기본값이 false라 `executeSequential`로 실행된다(과거엔 `MaxParallel` 설정대로 병렬이었음). 병렬이 필요하면 `Parallel: true`를 명시해야 한다. 아직 수정 안 함.
+- ~~API invoke가 순차로 돈다~~ → invoke에서 Coordinator 분기를 제거하면서 이 회귀는 소멸했다(invoke는 이제 단일 Runner만). 병렬 관련 플래그는 `cmd/workflow`의 fanout Coordinator에만 존재한다(`Parallel: true` 하드코딩).
 - **fanout Plan의 response_format 제거 효과는 Live로 재확인하지 못했다.** `planRequest`/`usesTools()` 변경 이후 workflow를 한 번도 돌리지 않았다. 다음 Live에서 fanout의 `plan created`에 goal이 모두 채워지는지, `orchestrator plan rejected`가 사라지는지 본다.
 - **`cmd/workflow`의 Verifier는 선택 사항이 됐다.** `s.agent.Version.VerifierModel != ""`일 때만 `NewVerifier`를 만든다. 비어 있으면 Runner가 Verifier 없이(`nil`) 돌아 검증이 생략된다. 검증이 의도치 않게 빠지는지 버전 설정을 확인한다.
 - `orchestratorModel` 상수는 현재 `anthropic/claude-sonnet-5-5`(stage/fanout Plan 공통). 값은 코드가 기준이다.
@@ -73,7 +73,8 @@ fileMatchPattern: 'aidea-api-agent/{agent,cmd/workflow,cmd/agent,router/agent}/*
 - 이중 Aggregate(fanout Aggregate + stage Aggregate) 중복 — 비싼 호출(input 40K~50K)이라 제거 검토.
 - Verifier가 `pass:true`일 때 reason을 "placeholder"/빈 값으로 뱉는 경향(sonnet) — 판정은 맞으나 reason 부실. 특히 `pass:false`에 "placeholder"가 나오면 Worker가 고칠 방향을 못 받아 재시도가 맹목적이 된다. 미해결.
 - 모델/파라미터 하드코딩(`orchestratorModel`, MaxToken/MaxSubTasks) — 버전 설정으로 받기.
-- API invoke(`router/agent/run.go`), agent CLI(`cmd/agent`)는 아직 2계층/upstream 전달 개선 미적용.
+- 오케스트레이션 전략(2계층 on/off, fanout 병렬 여부)을 **에이전트 버전 설정**으로 올리고, 조립을 `agent` 패키지의 공통 빌더로 추출해 `cmd/workflow`와 다른 진입점이 같은 조립 로직을 공유하는 방향. 현재는 2계층 조립이 `cmd/workflow/service.go:Run`에만 있어, 전파 시 중복이 생기지 않게 빌더로 모아야 한다. (단, fanout response_format 변경이 Live 미검증 상태라 그 검증 이후 착수 권장.)
+- agent CLI(`cmd/agent`)는 단일 Runner 유지(upstream/2계층 미적용). invoke도 단일 Runner로 확정(위 비교표 참고).
 
 ## 작업 방식 메모
 - 이 재설계는 Live 실행 로그를 보며 반복적으로 튜닝한 결과다. 변경 → Live 1회 실행 → 로그(`plan created`, `spinx done`, reject/재시도 패턴) 분석 → 원인 재확정 → 재수정의 순서를 따랐다. 가설이 로그로 반증되면 바로 정정했다(예: "haiku 역량 문제" → "Plan이 sonnet임을 확인 후 구조적 문제로 정정").

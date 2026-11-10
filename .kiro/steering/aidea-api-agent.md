@@ -51,9 +51,9 @@ cmd/agent/       # agent 실행 CLI (cli.go, main.go, service.go)
 cmd/workflow/    # workflow task CLI (Argo task 컨테이너)
 router/
   index.go       # 최상위 Router(): /, /health, auth 미들웨어 + agent 라우트 연결
-  agent/         # 핸들러: agent.go, run.go, version.go, subscribe.go
-                 #   index.go (라우트 트리 + 서비스 init), type.go (기본 프롬프트 템플릿/상수)
-service/agent/   # service.go — DB 접근 계층 (모든 쿼리 SQLBoiler)
+  agent/         # 핸들러 ((a *api) 메서드): agent.go, run.go, version.go, subscribe.go
+                 #   index.go (api 구조체 정의 + 라우트 트리 + &api{...} 조립), type.go (기본 프롬프트 템플릿/상수)
+store/           # agent.go — DB 접근 계층 (package store, type Agent, 모든 쿼리 SQLBoiler)
 agent/           # 실행 엔진: chat.go, runner.go, worker.go, verifier.go,
                  #   orchestrator.go, prompt.go, parse.go, history.go,
                  #   response_format.go, spinx.go, type.go, index.go (+ *_test.go)
@@ -70,14 +70,15 @@ config/          # index.go (Config 로더) + local.yaml, dev.yaml, live.yaml
 ## 코딩 관례
 
 ### 파일 네이밍
-- `index.go` — 패키지 진입/배선 파일. 패키지 `init()`, 패키지 레벨 공유 var, `Router(...)`/셋업을 담는다. 새 패키지 추가 시 이 관례를 따른다.
+- `index.go` — 패키지 진입/배선 파일. `Router(...)` 셋업 함수와 `router/agent`의 `api` 구조체 정의를 담는다.
 - `type.go` — 패키지 로컬 상수와 작은 타입.
 - 그 외 파일은 도메인 관심사별 명명 (`agent.go`, `run.go`, `worker.go` 등).
 
 ### DI 스타일
-- **패키지 레벨 싱글톤 + 패키지별 `init()` 배선**. 생성자로 `main`에서 주입하지 않는다.
-- `config/index.go`가 `ENV`로 선택된 YAML + `.env`를 로드해 싱글톤 생성, `cfg.Get()`로 노출. 모든 `init()`은 `hexim.LoadEnv()` 호출.
-- 서비스는 명시적 생성자 `NewService(db, readDb *sql.DB)` 사용 — 쓰기(`anxer`)/읽기(`anxer_ro`) 커넥션 분리.
+- DB 접근 계층은 `store` 패키지(`type Agent`)로 분리하고 명시적 생성자 `store.NewAgent(db, readDb *sql.DB)` 사용 — 쓰기(`anxer`)/읽기(`anxer_ro`) 커넥션 분리. (이전 `service/agent`의 `NewService`/`Service`에서 이름을 바꿈 — stutter 회피 + 실행 엔진 `agent` 패키지와의 혼동 제거.)
+- **핸들러 DI는 구조체 방식**: `router/agent`의 핸들러는 `api` 구조체 메서드다 — `type api struct { agentStore *store.Agent }`, 리시버 `(a *api)`. `Router()`가 `store.NewAgent(...)`로 store를 만들어 `a := &api{agentStore: ...}`로 직접 생성(재사용 없어 `NewAPI` 생성자 없음)하고, 라우트를 `a.get`/`a.invoke` 식으로 등록한다. 구조체명은 `api`(소문자 비공개) — Fiber의 `Group(prefix, handlers ...any)` 미들웨어 인자 `handlers`와 겹치지 않도록. 공통 규칙은 `go-conventions.md`의 "HTTP 핸들러 DI" 참고.
+  - 예외: `subscribe(add bool)`는 add/del 두 라우트를 한 핸들러로 처리하려고 `(a *api) subscribe(add bool) func(fiber.Ctx) error` 꼴(메서드 + 인자 받는 클로저 반환). `remove`는 no-op 스텁이라 아직 `api` 메서드가 아닌 패키지 함수로 남아 있다(store 미사용).
+  - `config/index.go`는 `ENV`로 선택된 YAML + `.env`를 로드해 `cfg.Get()` 싱글톤으로 노출(`init()`에서 `hexim.LoadEnv()`). store/엔진 조립이 아직 `Router()` 안에 있어 완전한 composition root(`main` 주입)로는 추가 전환 여지가 있다.
 
 ### 에러 처리
 - `hexim/errors` 패키지를 별칭 `er`로 사용.
@@ -109,12 +110,12 @@ config/          # index.go (Config 로더) + local.yaml, dev.yaml, live.yaml
 
 ## 요청 흐름
 
-`router/index.go` → `router/agent/index.go` 라우트 트리 → `router/agent/*.go` 핸들러 → `service/agent`(DB) 및/또는 `agent/`(실행 엔진) → `types.ToXxx` 변환 → `c.JSON`. 에러는 `er.Wrap`/`er.New`로 버블업되어 `middleware.ErrorHandler()`가 렌더링.
+`router/index.go` → `router/agent/index.go` 라우트 트리 → `router/agent/*.go` 핸들러 → `store`(DB) 및/또는 `agent/`(실행 엔진) → `types.ToXxx` 변환 → `c.JSON`. 에러는 `er.Wrap`/`er.New`로 버블업되어 `middleware.ErrorHandler()`가 렌더링. (핸들러의 store 핸들은 `agentStore` 변수.)
 
 - **인증**: `/`, `/health` 제외 모든 라우트가 `middlewares.Authentication(...)`(JWT + Redis 세션, `AIDEA_ACCESS_ROLE`로 역할 필터) + `middlewares.RequestIdGenerator()` 통과. 사용자: `c.Value(types.ContextKeyUser).(*typ.User)`.
 - **프롬프트 조합**: 엔진 기본 프롬프트가 우선. 버전의 `system_prompt`를 `{{AGENT_SYSTEM_PROMPT}}` placeholder에 주입(`systemPrompt.Make()`). 충돌하는 사용자 지시는 무시.
-- **Run 저장**: 앱 생성 UUID로 `types.AgentRun` 구성 → 엔진 실행 → `agentService.SetRun(...)`(트랜잭션으로 `agent_run` + 모델별 `agent_usage` insert). `history`는 DB에만 저장, 응답에서는 제거(`run.History = nil`).
-- **SSE 스트리밍**: `text/event-stream` 헤더, `c.SendStreamWriter`, `data: {json}\n\n` 프레임, 5분 타임아웃, panic recover. 첫 이벤트 `id`를 run UUID로 교체. 스트림 모드는 검증 없음.
+- **Run 저장**: 앱 생성 UUID로 `types.AgentRun` 구성 → 엔진 실행 → `agentStore.SetRun(...)`. `agent_run`은 `s.db`로 먼저 insert하고, `usages`가 있으면 별도 트랜잭션으로 모델별 `agent_usage`를 넣는다(usage는 보조 데이터라 run과 원자적으로 묶지 않음 — 의도된 설계). 저장 실패해도 응답은 반환하되 `zap.L().Error`로 로깅한다. `history`는 DB에만 저장, 응답에서는 제거(`run.History = nil`).
+- **SSE 스트리밍**: `text/event-stream` 헤더, `c.SendStreamWriter`, `data: {json}\n\n` 프레임, 5분 타임아웃, panic recover. 첫 이벤트 `id`를 run UUID로 교체. 스트림 모드는 검증 없음(`Stream.Enable && Verifier` 조합은 400). `NewChat`은 `version.Model`을 쓴다(과거 `VerifierModel` 오용 버그는 수정됨).
 
 ## 워크플로우 Task 간 데이터 전달
 
@@ -146,9 +147,13 @@ go test ./...
 
 > `cmd/workflow` 쪽 항목은 2계층 재설계로 상당 부분 해소됨 — 최신 상태는 `aidea-api-agent-orchestration.md`의 "남은 과제" 참고. 아래는 그 외 전반(주로 API invoke/agent CLI, DB, CI) 항목.
 
-1. **스트림 모드가 `model` 대신 `verifier_model` 사용** — `router/agent/run.go`의 `NewChat(... Model: version.VerifierModel ...)`.
-2. `DELETE /agent/{id}`의 `remove()`, `deleteVersion()`이 nil 반환 no-op 스텁.
-3. **workflow/agent CLI 에러에 token이 로깅될 수 있음** — `er.WithKeyValue("body", res.Body())` 등으로 응답 본문이 필드에 실림. go-conventions의 "토큰·시크릿 로그 금지"와 충돌.
-4. `version_no` 발급 시 `SELECT ... FOR UPDATE` 행 잠금 부재(동시성 gap, README_DB §4-2).
-5. `sqlboiler.toml`에 운영 DB 자격증명이 평문 — 환경변수 분리 권장.
-6. API invoke(`router/agent/run.go`), agent CLI(`cmd/agent`)는 아직 단층 구조(Upstreams/RunInput 미전달, 모델/파라미터 하드코딩, 최종 Verifier 주석 처리). 자세한 건 `aidea-api-agent-orchestration.md`의 비교표 참고.
+1. `DELETE /agent/{id}`의 `remove()`, `deleteVersion()`이 nil 반환 no-op 스텁(미구현).
+2. **workflow/agent CLI 에러에 token이 로깅될 수 있음** — `er.WithKeyValue("body", res.Body())` 등으로 응답 본문이 필드에 실림. go-conventions의 "토큰·시크릿 로그 금지"와 충돌. (검토 중)
+3. `version_no` 발급 시 `SELECT ... FOR UPDATE` 행 잠금 부재(동시성 gap, README_DB §4-2).
+4. `sqlboiler.toml`에 운영 DB 자격증명이 평문 — 환경변수 분리 권장.
+5. **invoke는 단일 Runner 전용으로 정리됨** — 오케스트레이션(2계층)은 즉석 HTTP 요청 성격에 안 맞고(비용·단계 의존 없음) 호출자가 전략을 판단할 수 없어, `request.Orchestrator` 분기를 제거했다. invoke는 Worker(+조건부 Verifier) 단일 Runner만 돈다. 2계층은 `cmd/workflow` 전용. agent CLI(`cmd/agent`)도 단일 Runner. 조립 전략을 열려면 요청 플래그가 아니라 **에이전트 버전 설정**으로 받는 방향이 맞다(남은 과제).
+
+### 해소됨 (이력)
+- 스트림 모드가 `model` 대신 `verifier_model`을 쓰던 버그 → `NewChat(Model: version.Model)`로 수정.
+- invoke의 Coordinator가 `Parallel` 미지정으로 순차 실행되던 회귀 → Coordinator 분기 자체를 제거하며 소멸.
+- DB 접근 계층 `service/agent`(`NewService`/`Service`) → `store`(`store.NewAgent`/`store.Agent`)로 리네임.
