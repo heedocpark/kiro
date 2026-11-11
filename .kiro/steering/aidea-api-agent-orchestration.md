@@ -56,9 +56,23 @@ fileMatchPattern: 'aidea-api-agent/{agent,cmd/workflow,cmd/agent,router/agent}/*
 
 6. **`validatePlan`은 빈 task/goal을 모아서 한 번에 거부** — 재시도 때 모델이 전부 한 번에 고치도록. (단, 1번처럼 response_format이 원인이면 재시도로도 안 고쳐짐 → response_format 제거가 근본 해법. 프롬프트/피드백 강화만으로는 구조적 원인을 못 이긴다.)
 
+## 프롬프트 캐시 배치 (`llm.WithCache`)
+- 원칙: breakpoint는 **요청 간 동일한 구간의 마지막 블록**에만 건다. 그 앞 전체(tools → system → messages)가 캐시되고, 바뀌는 내용(`request`/`upstreams`/`fail_reasons`/`result`/`subtask_results`)은 반드시 뒤에 둔다. 최대 4개.
+- 현재 배치 (5m):
+  - **worker** `messages`: `user_instructions`(system+사용자 지시 — 같은 실행의 모든 subtask·실행 간 공유), `goal`(subtask 재시도)
+  - **verifier** `messages`: `system`(모든 subtask 검증 공유), `goal`(검증 재시도)
+  - **chat** `Stream`: `user_instructions`(대화 간 공유)
+  - **orchestrator**: **캐시 없음**. Plan/Aggregate는 system prompt가 달라 서로 공유 안 되고 실행당 1회씩이라, 재시도가 없으면 write 할증(1.25x)만 남는다. 실측(2026-11-11)에서 orchestrator로 보이는 sonnet 호출 8건 모두 read 0 → 제거.
+- 실측 요약(같은 run): haiku(worker) 히트율 60%·입력비용 −53%, sonnet(verifier 등) 히트율 32%·−25%. verifier의 system read(6936)는 매 호출 적중, goal breakpoint도 재시도에서 실제 재사용 확인.
+- 남은 과제
+  - **MCP 사용 호출**: `CandidateTools`가 요청 임베딩으로 도구를 골라 조합이 달라지면 prefix 맨 앞(tools)이 바뀌어 전체 miss. 도구 선택 결과에 따라 캐시 효과가 들쭉날쭉 — 별도 검토 필요.
+  - **tool 루프 입력**: 한 spinx 호출 안의 tool 루프 회차마다 breakpoint 뒤 대화(tool_use/result)가 일반 입력으로 재과금된다(worker 호출당 평균 ~14.6K 미캐시). hexim tool 루프에서 회차마다 마지막 tool_result에 breakpoint를 거는 안 검토 중.
+  - 역할별 판단을 정확히 하려면 spinx 호출 단위로 stage(plan/aggregate/worker/verifier)와 cache read/write를 남겨야 한다(현재 `agent_usage`는 run×model 단위).
+
 ## 로그 규약 (`spinx.go`, `orchestrator.go`)
 - `spinx send request`(요청 전) 로그는 제거했다 — `spinx done`과 중복.
 - 호출 1건이 끝나면 `spinx done`에 `spinx_id`, `input_bytes`, `tools`, `input_tokens`, `output_tokens`를 남긴다. 비용/입력 누적 추적의 핵심 로그.
+  - 주의: hexim 캐시 분리 이후 `input_tokens`는 **캐시 제외** 값이다. 캐시 read/write는 이 로그에 없으므로 전체 입력·히트율은 `agent_usage`/spinx `spinx_message`의 캐시 컬럼으로 본다.
 - `coordinator` 필드로 레이어를 구분한다(`stage`/`fanout`). 중첩되면 두 값이 다 붙는다(바깥→안쪽 순).
 - `plan created` 로그로 Plan이 만든 계획(id/task/goal 요약)을 가시화한다 — empty goal 같은 문제를 바로 포착하는 데 썼다.
 - 참고: `worker/runner/verifier/coordinator`의 start/done timer 로그는 `hexim.NewTimer`(공용 라이브러리) 소관이라 agent 쪽에서 끌 수 없다.

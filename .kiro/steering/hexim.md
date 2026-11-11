@@ -62,6 +62,21 @@ type Client interface {
 - **MCP 자동 헬스체크**: Ping 1분, Tools refresh 15분 주기, 재연결 로직
 - **가드레일**: AWS Bedrock Guardrail 연동 (콘텐츠 필터/프롬프트 공격/민감정보)
 
+### 프롬프트 캐시 (`llm/cache.go`)
+- **Content/Tool 단위로만 지정**한다: `Content.Cache`, `Tool.Cache` (`*Cache{TTL}`). `Message`/`Request` 레벨 캐시 필드는 없다(예전 `Request.Cache`/`WithCache(bool)`, `Message.Cache`는 제거됨).
+- 메시지 생성자 옵션: `NewSystemMessage(text, llm.WithCache(llm.CacheTTL5m))` — `MessageOption`(기존 `ClientOption`과 같은 "대상별 Option 타입 + 생성자 가변 인자" 패턴). 마지막 Content에 넣는다.
+- TTL: `CacheTTL5m`/`CacheTTL1h`, `CacheTTLNone("")`=캐시 안 함. JSON `true`→5m, `{"ttl":..}`→지정, 생략/null/false/`{}`→안 함. 직렬화는 `omitzero` + `(*Cache).IsZero()`로 비활성 시 생략.
+- 호출부는 nil일 수 있는 `Cache` 필드에 직접 접근하지 않고 `cacheable`(`cacheEnabled()`/`cacheTTL()`)로 판정한다.
+- 프로바이더: Anthropic `cache_control`, Bedrock `cachePoint`(5m은 `ttl` 생략 — 지정 시 Nova 등에서 400. 1h·tools 캐시는 `anthropic.` 모델만, 그 외는 5m으로 낮추거나 무시), OpenAI/Google은 무시(자동 캐시).
+- 캐시 prefix 순서는 tools → system → messages. 그래서 **tools는 이름순 정렬**(`Tools.sorted()`)하고, **tool 루프 마지막 회차도 tools를 유지**한 채 `tool_choice: none`(Anthropic/OpenAI)·`FunctionCallingConfig NONE`(Google)으로 막는다. Bedrock Converse는 none이 없고 기록에 toolUse가 있으면 toolConfig 필수라 프롬프트(`finalToolCallPrompt`, 마지막 user 메시지)로만 막는다. 종료 프롬프트를 system에 넣지 않는다.
+- breakpoint 배치 원칙: 요청 간 동일한 구간의 **마지막 블록**에만 지정, 바뀌는 내용은 그 뒤. 최대 4개. 5m은 read 1회면 이득(write 1.25x / read 0.1x), 1h는 2회 이상.
+
+### Usage (`llm/usage.go`)
+- 모든 프로바이더에서 `InputToken`은 **캐시 제외** 입력, `CacheReadToken`/`CacheWriteToken`은 분리. 전체 입력은 `TotalInputToken()`, 히트율은 `CacheHitRate()`(합산 후 호출). `SumByModel`은 캐시까지 합산.
+- Google: `InputToken = Prompt - CachedContent`, `OutputToken = Candidates + Thoughts`(thinking 포함), 스트림은 chunk 누적값이라 회차별 마지막 값 1회만 기록.
+- Bedrock: Converse `TokenUsage`를 `(*Bedrock).usage()`로 변환(Type `UsageBedrock`).
+- JSON 키는 `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`(omitzero).
+
 ## 코딩 관례
 - 에러는 커스텀 `errors` 패키지 사용. import 별칭은 `er` (`er.New`, `er.Wrap`).
 - 로깅은 `go.uber.org/zap` 사용.
@@ -91,8 +106,8 @@ type Client interface {
   - `bedrock.go` `payload`/`payloadStream` 두 곳에 **같은 분기 복붙** — `strings.Contains(model, "anthropic.claude-sonnet-5-5")` → `thinking=between_tools`, else `disabled`.
   - `splitMessages`의 `strings.Index(model, "nova")` → Nova 전용 프롬프트.
   - reasoning/thinking 매핑이 4개 프로바이더에 전부 다른 방식(구조체 vs map)으로 흩어짐.
-  - "마지막 툴 콜 턴엔 툴 끄기"(`i == MaxToolCalls-1`)가 각 파일에 분산(Anthropic `Tools=nil`, Google `Tools=nil`, OpenAI/Bedrock 프롬프트만).
-  - cache(`WithCache`) 적용 지점이 프로바이더별로 분산(Anthropic `CacheControl`, Bedrock `CachePoint`, OpenAI/Google 미적용).
+  - "마지막 툴 콜 턴엔 툴 끄기"(`i == MaxToolCalls-1`)가 각 파일에 분산 — 현재는 프로바이더별 헬퍼(`anthropicDisableToolCall`/`openaiDisableToolCall`/`googleDisableToolCall`/`bedrockFinalToolCallMessage`)로 정리됐지만 여전히 파일마다 따로 호출.
+  - cache 변환이 프로바이더별(`anthropicCacheControl`, `(*Bedrock).cachePoint`)로 분산, 모델별 캐시 지원 여부는 `(*Bedrock).anthropicModel()`(`strings.Contains`)에 의존 → ModelSpec의 `SupportsCache`/`SupportsExtendedTTL`/`SupportsToolCache` 후보.
   - 미지원 기능은 런타임 에러로 표현(`BedrockEmbedding.InvokeStream` "does not support streaming" 등).
 - `Store`(`llm/store.go`): `ProviderType`(`openai/anthropic/google/bedrock`) → `client.Model()` 2단계 맵. **Bedrock의 anthropic/nova/titan/twelvelabs가 전부 단일 `ProviderBedrock` 아래 평평하게** 들어가, model capability 구분은 model 문자열에만 의존.
 - `NewResponse`의 provider 문자열이 이미 `"bedrock-anthropic"`처럼 **transport+model을 합쳐** 넣음 → 분리 시 자연스러운 경계.

@@ -118,3 +118,10 @@ CJ MezzoMedia AI 챗봇 **앤써(AnXer)**의 외부 연동 API 게이트웨이. 
 - MCP status 비트 켜기/끄기 → read-modify-write 금지. `queries.Raw`로 `status = status | ?` / `& ~?` 원자 UPDATE(위 "MCP 상태 비트 쓰기").
 - 무거운 주기 작업 → 핸들러 말고 `cmd/<name>` 배치로. 상태를 큐로 쓰고(예: `requested`) 배치가 집어가게.
 - 커밋 전 `go build ./...`, `go vet ./...`, `gofmt -l`. 통합 테스트는 로컬 외부 서비스가 떠 있을 때 `go test ./service/... ./store/...`.
+
+## 토큰 사용량 기록 규칙
+- hexim `Usage.InputToken`은 캐시 제외 값이다. spinx도 **`tokens`/`input_tokens`는 캐시 제외**, 캐시는 `cache_read_tokens`/`cache_write_tokens` 별도 컬럼에 저장한다(`spinx_message`·`spinx_session`·`spinx_daily_stat`). 집계 시 `tokens`에 캐시를 다시 더하지 않는다.
+- user 메시지 행에 input + 캐시 read/write, assistant 행에 output만 넣는다(`router/spinx/index.go` chat/stream, `service/session.go` 요약 공통).
+- Redis 일일 한도(`SetDailyUsageToken`)는 `InputToken + OutputToken`(캐시 제외).
+- `anxer-tools`는 전역 `ToolStore`의 `*llm.Tool`을 **복사해서** 요청별 `Headers`/`Cache`를 넣는다(공유 객체 직접 수정 금지 — 동시 요청 간 headers 혼입).
+- 요청의 `Content.Cache`/`Tool.Cache`는 `*llm.Request` 바인딩으로 hexim까지 그대로 전달된다. 사용 규칙은 `openapi.yaml` `chat_request`에 문서화.
