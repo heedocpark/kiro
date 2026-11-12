@@ -24,7 +24,7 @@ CJ MezzoMedia AI 챗봇 **앤써(AnXer)**의 외부 연동 API 게이트웨이. 
   - `router/mcp` — 관리자용 MCP 승인·거부·도구 조회
   - `router/usage` — 사용량 조회·집계·리포트
 - **`service/`** — **오케스트레이션 계층**. LLM 호출(`hexim/llm`), Redis 캐시, OpenSearch, Kiwi(gRPC), 메일 등 외부 시스템 연동과 비즈니스 로직. DB 접근은 직접 하지 않고 `store`에 위임한다.
-- **`store/`** — **DB 전용 계층**(SQLBoiler). `store.Session`/`Usage`/`MCP`/`RAG`, 생성자 `store.NewXxx(db, readDb *sql.DB)`. 비즈니스 로직 없음. 읽기 `s.readDb`, 쓰기 `s.db`.
+- **`store/`** — **DB 전용 계층**(SQLBoiler). `store.Session`/`Usage`/`MCP`/`RAG`, 생성자 `store.NewXxx(db, readDb *sql.DB)`. 비즈니스 로직 없음. 읽기 `s.readDb`, 쓰기 `s.db`. 단, **쓰기 판단에 쓰는 조회와 쓰기 직후 다시 읽는 조회(read-after-write)는 `s.db`** — 읽기 복제 지연으로 방금 쓴 값이 안 보인다(예: `store.MCP.ReviewTargets`/`Server`/`Connection`). 통합 테스트도 쓰기 직후 단언하므로 store를 `NewXxx(db, db)`로 만든다.
 - **`database/`** — SQLBoiler 생성 코드. 직접 수정 금지.
 - **`types/`** — 모델 alias, MCP/RAG/사용량 도메인 타입 + 변환 헬퍼.
 - **`cmd/<name>/`** — 주기 배치(`mcp-checker`, `mcp-reviewer`). ArgoCD cron으로 스케줄. 아래 "MCP 배치" 참고.
