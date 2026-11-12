@@ -63,10 +63,10 @@ CJ MezzoMedia AI 챗봇 **앤써(AnXer)**의 외부 연동 API 게이트웨이. 
   - tool 버전 `ai_verdict`(AI) · `approval_status`(관리자 확정)
   - connection `connection_status`(ok/disconnected/suspended, checker)
   - connection_tool `selection_status`(앱) · `remote_status`(present/deleted, 동기화)
-- **노출 조건은 store 한 곳에서만 판단**(`ServableTools`/`AvailableConnections`): server approved + connection ok + selected + present + 버전 approved + embedding 있음. 라우터에서 필드를 조합해 판단하지 않는다.
+- **노출 조건은 store 한 곳에서만 판단**(`ServableTools`/`ServableConnections`): server approved + connection ok + selected + present + 버전 approved + embedding 있음. 라우터에서 필드를 조합해 판단하지 않는다.
 - **내용 변경 = 새 버전.** tool hash는 hexim이 원격 원본으로 계산한 값을 그대로 저장하고 DB 값으로 재계산하지 않는다(JSON 컬럼 정규화로 hash가 달라져 무한 재심사가 된다). 버전 행은 불변이고 connection_tool의 `tool_no`만 옮긴다.
-- **경합하는 고빈도 전이는 가드 UPDATE + affected rows.** `UPDATE ... SET review_status='changed' WHERE no=? AND approval_status='approved' AND review_status='none'`처럼 이전 상태를 WHERE에 건다. affected 1이면 이번에 바꾼 것(메일 1회), 0이면 skip. 적용: `RequestReview`/`MarkChanged`/`SaveAIReview`/`FailAIReview`, 연결 상태(`SetDisconnected`/`SetPingFailed`/`SetPingSucceeded`).
-  - MySQL `SET`은 왼쪽부터 평가되어 앞 대입 결과가 뒤 식에 보인다. 원래 값을 봐야 하는 식을 앞에 둔다(`FailAIReview`, `SetDisconnected` 참고).
+- **경합하는 고빈도 전이는 가드 UPDATE + affected rows.** `UPDATE ... SET review_status='changed' WHERE no=? AND approval_status='approved' AND review_status='none'`처럼 이전 상태를 WHERE에 건다. affected 1이면 이번에 바꾼 것(메일 1회), 0이면 skip. 적용: `RequestReview`/`MarkChanged`/`SaveAIReview`/`FailAIReview`, 연결 상태(`RecordConnectFailure`/`RecordPingFailure`/`RecordPingSuccess`).
+  - MySQL `SET`은 왼쪽부터 평가되어 앞 대입 결과가 뒤 식에 보인다. 원래 값을 봐야 하는 식을 앞에 둔다(`FailAIReview`, `RecordConnectFailure` 참고).
 - **관리자 결정(Approve/Reject)은 트랜잭션 + `SELECT ... FOR UPDATE`.** 서버 행을 잠그고 tool 버전 확정 등 여러 행을 함께 바꾼다. 저빈도라 잠금 비용은 문제없다.
 - **SQL에서 시간 비교에 쓰는 컬럼은 DB `NOW()`로만 쓴다**(`last_seen_at` 삭제 유예 15분). Go `time.Now()`와 섞으면 앱/DB 시간대 차이로 판정이 틀어진다. 표시용 시각은 Go 시간이어도 된다.
 - **JOIN 쿼리에서는 `XxxTableColumns`(테이블 한정 컬럼)를 쓴다.** `XxxColumns`는 비한정이라 `no`/`name`/`created_at`이 겹치면 ambiguous 에러. where 헬퍼는 생성 코드가 이미 한정한다.
@@ -77,7 +77,7 @@ CJ MezzoMedia AI 챗봇 **앤써(AnXer)**의 외부 연동 API 게이트웨이. 
 
 무거운 주기 작업은 HTTP 핸들러가 아니라 `cmd/<name>/main.go` 배치로 분리하고, ArgoCD cron으로 스케줄한다. `main`이 조립 지점(`init()`/전역 var 금지, go-conventions 참고), 동시성은 `errgroup.SetLimit(10)`으로 제한, 실제 에러/panic일 때만 `os.Exit(1)`.
 
-- **`mcp-checker`** — approved 서버의 **connection**(app + 토큰)마다 헬스체크. Connect→Ping→tool 동기화(`SyncConnection` → `store.SyncTools`). 실패 단계별로 `SetDisconnected`/`SetPingFailed`(3회 초과 시 suspended)/`SetPingSucceeded`. suspended도 대상에 포함해 복구를 감지한다. ping 실패는 인프라 에러이므로 exit 1 대상.
+- **`mcp-checker`** — approved 서버의 **connection**(app + 토큰)마다 헬스체크. Connect→Ping→tool 동기화(`SyncConnectionTools` → `store.SyncTools`). 실패 단계별로 `RecordConnectFailure`/`RecordPingFailure`(3회 초과 시 suspended)/`RecordPingSuccess`. suspended도 대상에 포함해 복구를 감지한다. ping 실패는 인프라 에러이므로 exit 1 대상.
 - **`mcp-reviewer`** — `review_status=requested` 서버(= AI 심사 대기 큐)를 긁어 각각 `AIReview` 실행. **tool이 rejected로 판정되는 건 정상 결과**(AIReview가 `nil` 반환)이므로 exit 0. LLM/DB/파싱 실패나 panic만 exit 1. 조회는 `store.MCP.RequestedServers`.
 
 **ArgoCD cron 스케줄** (`argocd-apps/aidea/aidea-api-spinx/base/cronjob.yaml`)
@@ -125,13 +125,13 @@ CJ MezzoMedia AI 챗봇 **앤써(AnXer)**의 외부 연동 API 게이트웨이. 
 - 새 핸들러 → 해당 `router/<group>`의 `(a *api)` 메서드로. 의존성은 `api`에 추가하고 `Router()`에서 주입.
 - DB + 외부시스템 원자성 필요 → store에 콜백 받는 tx 메서드 추가(위 패턴).
 - MCP 상태 전이 → 컬럼별 가드 UPDATE(`WHERE <이전 상태>` + affected rows) 또는 관리자 결정은 tx + `FOR UPDATE`. 비트 연산·read-modify-write 금지(위 "MCP 데이터 모델과 상태 쓰기").
-- MCP 노출 조건 변경 → `store.ServableTools`/`AvailableConnections` 한 곳만 고친다.
+- MCP 노출 조건 변경 → `store.ServableTools`/`ServableConnections` 한 곳만 고친다.
 - 무거운 주기 작업 → 핸들러 말고 `cmd/<name>` 배치로. 상태를 큐로 쓰고(예: `requested`) 배치가 집어가게.
 - 커밋 전 `go build ./...`, `go vet ./...`, `gofmt -l`. 통합 테스트는 로컬 외부 서비스가 떠 있을 때 `go test ./service/... ./store/...`.
 
 ## 토큰 사용량 기록 규칙
 - hexim `Usage.InputToken`은 캐시 제외 값이다. spinx도 **`tokens`/`input_tokens`는 캐시 제외**, 캐시는 `cache_read_tokens`/`cache_write_tokens` 별도 컬럼에 저장한다(`spinx_message`·`spinx_session`·`spinx_daily_stat`). 집계 시 `tokens`에 캐시를 다시 더하지 않는다.
 - user 메시지 행에 input + 캐시 read/write, assistant 행에 output만 넣는다(`router/spinx/index.go` chat/stream, `service/session.go` 요약 공통).
-- Redis 일일 한도(`SetDailyUsageToken`)는 `InputToken + OutputToken`(캐시 제외).
+- Redis 일일 한도(`AddDailyUsageToken`)는 `InputToken + OutputToken`(캐시 제외).
 - `anxer-tools`는 전역 `ToolStore`의 `*llm.Tool`을 **복사해서** 요청별 `Headers`/`Cache`를 넣는다(공유 객체 직접 수정 금지 — 동시 요청 간 headers 혼입).
 - 요청의 `Content.Cache`/`Tool.Cache`는 `*llm.Request` 바인딩으로 hexim까지 그대로 전달된다. 사용 규칙은 `openapi.yaml` `chat_request`에 문서화.

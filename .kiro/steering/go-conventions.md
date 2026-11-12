@@ -144,13 +144,13 @@ er.New("...", er.WithKeyValue("key", val))                // 필드 부착
   ```
 - **upsert 패턴**: `ID == uuid.Nil`이면 `Insert(ctx, s.db, boil.Infer())` 후 생성 필드 역채움, 아니면 `Update(ctx, s.db, boil.Whitelist(...)/x.WhiteList())`. whitelist는 변경된 필드만 수집(비면 "no value to change").
 - **페이징: store에는 `page.Paging` 구조체를 넘기지 않는다.** store 메서드는 `limit, offset int`를 받고, 호출부(핸들러)가 `paging.Limit()` / `paging.Offset()`으로 변환해 넘긴다. `page.Paging`은 쿼리스트링 바인딩 태그(`query:"page"`)가 붙은 **웹 계층 타입**이라 DB 계층까지 내려보내면 레이어 경계를 넘는다. store는 "LIMIT/OFFSET에 꽂을 정수 둘"만 알면 되고, 1-based page → offset 변환 규칙은 `page.Paging`이 책임진다.
-  - **인자 순서**: `ctx` → 식별자/필터(`userNo`, `serverNo`, `status` 등) → **`limit, offset`은 맨 뒤**. 페이징은 조회의 부가 조건이라 중요도가 낮으므로 핵심 필터 뒤에 둔다.
+  - **인자 순서**: `ctx` → 식별자/필터(`userNo`, `serverNo`, `approval` 등) → **`limit, offset`은 맨 뒤**. 페이징은 조회의 부가 조건이라 중요도가 낮으므로 핵심 필터 뒤에 둔다.
   ```go
   // 핸들러: paging → primitive, limit/offset은 마지막
-  servers, total, err := a.mcpService.AdminServers(ctx, status, paging.Limit(), paging.Offset())
-  tools, total, err := a.mcpService.AdminServerTools(ctx, serverNo, status, paging.Limit(), paging.Offset())
+  servers, total, err := a.mcpService.Servers(ctx, filter, paging.Limit(), paging.Offset())
+  tools, total, err := a.mcpService.ServerTools(ctx, serverNo, approval, paging.Limit(), paging.Offset())
   // store: 웹틱한 타입을 모르고, limit/offset이 꼬리에 온다
-  func (m *MCP) AdminServerTools(ctx context.Context, serverNo int64, status typ.MCPStatus, limit, offset int) (...) {
+  func (m *MCP) ServerTools(ctx context.Context, serverNo int64, approval typ.MCPApprovalStatus, limit, offset int) (...) {
       database.SpinxMCPServerTools(..., qm.Limit(limit), qm.Offset(offset)).All(ctx, m.readDb)
   }
   ```
