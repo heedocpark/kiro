@@ -43,33 +43,42 @@ CJ MezzoMedia AI 챗봇 **앤써(AnXer)**의 외부 연동 API 게이트웨이. 
 
 적용 사례(그대로 따를 것):
 
-- **`store.MCP.Review(ctx, serverNo, embed func(name, desc string, schema []byte) (hash string, embedding []byte, err error))`**
-  store가 tx를 열고 → tool들 조회 → 각 tool마다 `embed` 콜백(= service의 LLM 임베딩) 호출 → tool 업데이트 → 서버 상태 전환까지 한 트랜잭션. 임베딩 하나라도 실패하면 전부 롤백.
+- **`store.MCP.SyncTools(ctx, connNo, serverNo, remote)`**
+  원격 tool 목록을 한 트랜잭션에 반영: tool 내용 버전 찾기/생성 → connection_tool 포인터 갱신 → `last_seen_at`/deleted 일괄 UPDATE. 중간 실패 시 전부 롤백.
 - **`store.RAG.InsertIndex(ctx, appNo, name, createIndex func(ragNo int64) error)`** / **`DeleteIndex(ctx, appNo, ragNo, deleteIndex func() error)`**
   MySQL insert/delete를 tx에 쌓고, 콜백에서 OpenSearch 인덱스를 생성/삭제. 콜백 실패 시 tx 롤백 → MySQL에 고아 레코드가 남지 않는다. **커밋은 콜백 성공 후에만.**
-- **`store.MCP.SaveReview(ctx, server, toolReviews, review)`**
-  AIReview의 tool 판정 + 서버 상태/설명/임베딩을 한 트랜잭션에 일괄 저장.
-
+- **`store.MCP.SaveAIReview(ctx, serverNo, verdicts, desc)`**
+  AI 판정(tool 버전별 verdict/임베딩) + 서버 설명 + `requested → ai_reviewed` 전이를 한 트랜잭션에. 서버 전이 가드(affected 1)가 실패하면(그사이 관리자 reject 등) 전부 롤백. LLM/임베딩 호출은 service에서 트랜잭션 **밖**에서 끝낸 뒤 결과만 넘긴다.
 ### 알아둘 한계
 
 - 콜백(LLM/OpenSearch = 네트워크)이 **트랜잭션 안에서** 실행되므로 트랜잭션이 길어진다. 원자성과 맞바꾼 의도된 선택이다. 대상이 수백 건이면 트랜잭션 점유 시간을 고려할 것.
 - 콜백 성공 후 `tx.Commit()` 자체가 실패하는 극히 드문 경우엔 역방향 불일치(예: OpenSearch엔 있고 MySQL엔 없음)가 가능하다. 완전한 2PC는 불가. 삭제 콜백은 **멱등**하게(이미 없으면 404를 성공 취급) 만들어 재시도가 수렴하게 한다.
 
-## MCP 상태 비트 쓰기 (동시성)
+## MCP 데이터 모델과 상태 쓰기 (동시성)
+기조: **MCP는 심사(AI 1차 + 관리자 확정)를 받아야 서비스되고, 심사 후 변경된 것은 재심사로 처리한다.** 상세는 레포 `docs/mcp-overview.md`.
 
-`spinx_mcp_server.status`는 비트플래그(`types/mcp_status.go`)다. `suspended`/`disconnected`/`changed`처럼 **개별 비트를 켜고 끄는 쓰기는 read-modify-write로 하지 않는다.** 앱의 5분 ticker(`initMCPServers`)와 `cmd/mcp-checker` 배치가 같은 서버 row를 동시에 건드릴 수 있어, "읽어서 Go에서 비트 조작 후 전체 status 덮어쓰기"는 상대가 세운 다른 비트를 날리는 lost update를 만든다.
-
-- **비트 누적/해제는 UPDATE 안에서 원자적으로.** `status = status | ?`(켜기), `status = status & ~?`(끄기)를 `queries.Raw(...).ExecContext`로 DB에 위임한다. `failure_count = failure_count + 1` 같은 증가도 동일.
-  - 적용: `store.MCP`의 `SetDisconnected`/`SetPingFailed`/`SetPingSucceeded`/`MarkChanged`.
-- **"이미 켜져 있었나" 판정이 필요하면 WHERE 가드 + affected rows.** 예: `MarkChanged`는 `WHERE no = ? AND status & <changed> = 0`으로 UPDATE하고 `RowsAffected()`가 1이면 이번에 세운 것(= 메일 발송), 0이면 이미 켜져 있던 것(= skip). 멱등성과 원자성을 동시에 얻는다.
-- **예외**: `Approve`/`Reject`는 비트 누적이 아니라 라이프사이클 상태를 **마스크로 통째 세팅**(`status.Approve()` 등)하고, 사람이 트리거하는 저빈도 작업이라 read-modify-write(`findServer` → `updateServerStatus`)를 유지한다. ping/`changed`처럼 배치와 경합하는 고빈도 비트 조작과는 성격이 다르다.
+- **테이블 4개, 심사 대상과 사용 주체 분리**: `spinx_mcp_server`(URL당 1행, 심사 대상) / `spinx_mcp_server_tool`(`(server, name, hash)`당 1행, 심사 단위 = tool 내용 버전) / `spinx_mcp_connection`(`(app, server)`당 1행, 토큰) / `spinx_mcp_connection_tool`(토큰별로 보이는 tool → 현재 버전 포인터). 같은 URL·같은 내용은 한 번 심사하면 모든 앱이 공유한다.
+- **상태는 축마다 컬럼 하나, 컬럼마다 쓰는 주체 하나.** 비트플래그 금지. 값은 `types/mcp_status.go`의 Go 상수로만 검증(DB CHECK 없음).
+  - server `approval_status`(pending/approved/rejected, 관리자) · `review_status`(none/changed/requested/ai_reviewed, 앱·배치·관리자)
+  - tool 버전 `ai_verdict`(AI) · `approval_status`(관리자 확정)
+  - connection `connection_status`(ok/disconnected/suspended, checker)
+  - connection_tool `selection_status`(앱) · `remote_status`(present/deleted, 동기화)
+- **노출 조건은 store 한 곳에서만 판단**(`ServableTools`/`AvailableConnections`): server approved + connection ok + selected + present + 버전 approved + embedding 있음. 라우터에서 필드를 조합해 판단하지 않는다.
+- **내용 변경 = 새 버전.** tool hash는 hexim이 원격 원본으로 계산한 값을 그대로 저장하고 DB 값으로 재계산하지 않는다(JSON 컬럼 정규화로 hash가 달라져 무한 재심사가 된다). 버전 행은 불변이고 connection_tool의 `tool_no`만 옮긴다.
+- **경합하는 고빈도 전이는 가드 UPDATE + affected rows.** `UPDATE ... SET review_status='changed' WHERE no=? AND approval_status='approved' AND review_status='none'`처럼 이전 상태를 WHERE에 건다. affected 1이면 이번에 바꾼 것(메일 1회), 0이면 skip. 적용: `RequestReview`/`MarkChanged`/`SaveAIReview`/`FailAIReview`, 연결 상태(`SetDisconnected`/`SetPingFailed`/`SetPingSucceeded`).
+  - MySQL `SET`은 왼쪽부터 평가되어 앞 대입 결과가 뒤 식에 보인다. 원래 값을 봐야 하는 식을 앞에 둔다(`FailAIReview`, `SetDisconnected` 참고).
+- **관리자 결정(Approve/Reject)은 트랜잭션 + `SELECT ... FOR UPDATE`.** 서버 행을 잠그고 tool 버전 확정 등 여러 행을 함께 바꾼다. 저빈도라 잠금 비용은 문제없다.
+- **SQL에서 시간 비교에 쓰는 컬럼은 DB `NOW()`로만 쓴다**(`last_seen_at` 삭제 유예 15분). Go `time.Now()`와 섞으면 앱/DB 시간대 차이로 판정이 틀어진다. 표시용 시각은 Go 시간이어도 된다.
+- **JOIN 쿼리에서는 `XxxTableColumns`(테이블 한정 컬럼)를 쓴다.** `XxxColumns`는 비한정이라 `no`/`name`/`created_at`이 겹치면 ambiguous 에러. where 헬퍼는 생성 코드가 이미 한정한다.
+- 목록 조회는 `qm.Select`로 `embedding`을 제외한다(수십 KB).
+- 이름 컬럼(`name`, `url`)은 `utf8mb4_bin` — MCP tool 이름은 대소문자를 구분한다.
 
 ## MCP 배치 (cmd)
 
 무거운 주기 작업은 HTTP 핸들러가 아니라 `cmd/<name>/main.go` 배치로 분리하고, ArgoCD cron으로 스케줄한다. `main`이 조립 지점(`init()`/전역 var 금지, go-conventions 참고), 동시성은 `errgroup.SetLimit(10)`으로 제한, 실제 에러/panic일 때만 `os.Exit(1)`.
 
-- **`mcp-checker`** — approved 서버의 헬스체크. 서버마다 Connect→Ping→tool 재동기화(`SetTools`). 실패 단계별로 `SetDisconnected`/`SetPingFailed`(3회 초과 시 suspended)/`SetPingSucceeded`. ping 실패는 인프라 에러이므로 exit 1 대상.
-- **`mcp-reviewer`** — `requested` 서버(= AI 심사 대기 큐)를 긁어 각각 `AIReview` 실행. **tool이 rejected로 판정되는 건 정상 결과**(AIReview가 `nil` 반환)이므로 exit 0. LLM/DB/파싱 실패나 panic만 exit 1. 조회는 `store.MCP.RequestedServers`.
+- **`mcp-checker`** — approved 서버의 **connection**(app + 토큰)마다 헬스체크. Connect→Ping→tool 동기화(`SyncConnection` → `store.SyncTools`). 실패 단계별로 `SetDisconnected`/`SetPingFailed`(3회 초과 시 suspended)/`SetPingSucceeded`. suspended도 대상에 포함해 복구를 감지한다. ping 실패는 인프라 에러이므로 exit 1 대상.
+- **`mcp-reviewer`** — `review_status=requested` 서버(= AI 심사 대기 큐)를 긁어 각각 `AIReview` 실행. **tool이 rejected로 판정되는 건 정상 결과**(AIReview가 `nil` 반환)이므로 exit 0. LLM/DB/파싱 실패나 panic만 exit 1. 조회는 `store.MCP.RequestedServers`.
 
 **ArgoCD cron 스케줄** (`argocd-apps/aidea/aidea-api-spinx/base/cronjob.yaml`)
 
@@ -88,19 +97,19 @@ CJ MezzoMedia AI 챗봇 **앤써(AnXer)**의 외부 연동 API 게이트웨이. 
 - 조립 실패(DB/필수 설정)는 `Router()`에서 `log.Panic`. 현재 각 `Router()`가 `cfg.Get()`로 자급자족하는 건 레거시 잔재이며, 장기적으로 `main` 주입이 이상형(go-conventions 참고).
 
 ## MCP 상태 전환
+서버 상태 전환은 **의도별 전용 메서드**로 분리한다. 각 메서드는 DB 전환 + 필요 시 메일 발송을 조립한다. 서버 공용 상태 메일은 그 서버를 쓰는 모든 connection의 `notify_email`로(`notifyServer`).
+- `service.MCP.RequestReview(app, connNo, dryRun)` — none/changed → requested. 심사 대상(selected + present + pending 버전)이 없으면 400(rejected 서버는 서버 단위 재심사 허용). 무거운 작업 없이 큐잉만.
+- `service.MCP.AIReview(serverNo)` — LLM 보안 심사(20개 배치, 배치별 no 매핑, 누락 시 실패) → AI 승인 버전만 임베딩 → 승인 tool 집합 hash가 바뀌면 서버 설명 재생성 → `SaveAIReview`. **핸들러가 직접 호출하지 않고 `cmd/mcp-reviewer` 배치가 호출**한다. 실패/panic은 `defer`에서 `FailAIReview`(tool 판정 저장 안 함): 최초 심사는 rejected, 재심사는 approved 유지 + changed.
+- `service.MCP.Approve(serverNo)` — ai_reviewed에서만. tool 버전 `ai_verdict` → `approval_status` 확정, 서버 approved. 심사 중 새 변경이 남아 있으면 review를 changed로.
+- `service.MCP.Reject(serverNo, reason)` — 심사 중이면 이번 AI 판정 무효화(최초: rejected / 재심사: approved 유지 + changed), 심사 중이 아니면 **승인 철회**(kill switch).
+- `markChanged(serverNo)` — 동기화/선택 후 "selected + present + pending 버전"이 있으면 호출. approved 서버만 none → changed, 이번에 바뀐 경우만 메일.
+- `MailService`는 `service.MCP`에 생성자 주입. 메일은 `context.WithoutCancel`로 요청 종료와 무관하게 보낸다.
 
-서버 상태 전환은 **의도별 전용 메서드**로 분리한다(과거 거대 `SetServerStatus` switch는 폐기). 각 메서드는 DB 전환 + 필요 시 메일 발송을 조립한다.
+**상태 흐름**: `review_status` `none → (앱 /review) requested → (mcp-reviewer AIReview) ai_reviewed → (관리자 /approve) none`, 이때 `approval_status` approved. 승인 후 변경 감지 시 `changed` → 앱이 `/review`로 재심사 요청(자동 재심사 안 함 — 어차피 관리자 승인이 필요). 재심사 중에도 기존 승인분은 계속 서비스.
 
-- `service.MCP.Approve(serverNo)` — ai_reviewed 상태에서만 승인(가드 포함) + 승인 메일
-- `service.MCP.Reject(serverNo, reason)` — 거부 + 사유 기록 + 거부 메일
-- `service.MCP.MarkChanged(serverNo)` — changed 플래그(멱등: 이미 있으면 write/메일 skip)
-- `service.MCP.Review(serverNo)` — requested 전환 + tool 임베딩(위 콜백 트랜잭션)
-- `service.MCP.AIReview(serverNo)` — LLM 보안 심사 + 서버 설명/임베딩 생성 후 `SaveReview`로 ai_reviewed 전환. **핸들러가 직접 호출하지 않고 `cmd/mcp-reviewer` 배치가 호출**한다(아래 "MCP 배치" 참고).
-- `MailService`는 `service.MCP`에 생성자 주입. `sendMail`은 `(m *MCP)` 메서드.
+> **핸들러는 큐잉만, 전환은 배치가 한다.** `/spinx/mcp/:id/review`는 상태를 `requested`로만 올리고 끝낸다. 상태가 곧 큐이므로 배치 재시작/배포에도 유실 없이 다음 주기에 다시 집힌다.
 
-**상태 흐름**: `pending → (앱 /review) requested → (mcp-reviewer 배치의 AIReview) ai_reviewed → (관리자 /approve) approved`, 언제든 `rejected`/`suspended`. `AIReview`의 실패/panic은 `defer`에서 **서버만** rejected로 저장(부분 tool 저장 금지 — `SaveReview`에 `nil` 전달).
-
-> **핸들러는 큐잉만, 전환은 배치가 한다.** `/spinx/mcp/:id/review`(`requestMCPReview`)는 `service.Review`로 상태를 `requested`로만 올리고 끝낸다(무거운 LLM 심사를 HTTP 요청에서 동기로 돌리지 않는다). 실제 `requested → ai_reviewed` 전환은 `mcp-reviewer` 배치가 `requested` 서버를 긁어 `AIReview`를 돌려 수행한다. 상태가 곧 큐이므로 배치 재시작/배포에도 유실 없이 다음 주기에 다시 집힌다.
+**앱 API의 `:server_id`는 connection id**, 관리자 API(`/mcp/:server_id`)는 server id다. 채팅 요청의 `mcp.servers[].id`(connection id)는 `filterMCPServers`로 앱 자신 + global의 사용 가능한 connection만 허용한다(다른 앱 토큰 사용 방지). 승인 후 URL 변경은 불가(새로 등록), 헤더(토큰)는 자유 수정.
 
 ## 테스트
 
@@ -115,7 +124,8 @@ CJ MezzoMedia AI 챗봇 **앤써(AnXer)**의 외부 연동 API 게이트웨이. 
 - 새 DB 접근 → `store/`에 메서드 추가(타입드 query mod, `er.Wrap`). service는 위임.
 - 새 핸들러 → 해당 `router/<group>`의 `(a *api)` 메서드로. 의존성은 `api`에 추가하고 `Router()`에서 주입.
 - DB + 외부시스템 원자성 필요 → store에 콜백 받는 tx 메서드 추가(위 패턴).
-- MCP status 비트 켜기/끄기 → read-modify-write 금지. `queries.Raw`로 `status = status | ?` / `& ~?` 원자 UPDATE(위 "MCP 상태 비트 쓰기").
+- MCP 상태 전이 → 컬럼별 가드 UPDATE(`WHERE <이전 상태>` + affected rows) 또는 관리자 결정은 tx + `FOR UPDATE`. 비트 연산·read-modify-write 금지(위 "MCP 데이터 모델과 상태 쓰기").
+- MCP 노출 조건 변경 → `store.ServableTools`/`AvailableConnections` 한 곳만 고친다.
 - 무거운 주기 작업 → 핸들러 말고 `cmd/<name>` 배치로. 상태를 큐로 쓰고(예: `requested`) 배치가 집어가게.
 - 커밋 전 `go build ./...`, `go vet ./...`, `gofmt -l`. 통합 테스트는 로컬 외부 서비스가 떠 있을 때 `go test ./service/... ./store/...`.
 
