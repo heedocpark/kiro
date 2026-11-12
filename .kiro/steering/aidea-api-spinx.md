@@ -69,7 +69,7 @@ CJ MezzoMedia AI 챗봇 **앤써(AnXer)**의 외부 연동 API 게이트웨이. 
   - MySQL `SET`은 왼쪽부터 평가되어 앞 대입 결과가 뒤 식에 보인다. 원래 값을 봐야 하는 식을 앞에 둔다(`FailAIReview`, `RecordConnectFailure` 참고).
 - **관리자 결정(Approve/Reject)은 트랜잭션 + `SELECT ... FOR UPDATE`.** 서버 행을 잠그고 tool 버전 확정 등 여러 행을 함께 바꾼다. 저빈도라 잠금 비용은 문제없다.
 - **SQL에서 시간 비교에 쓰는 컬럼은 DB `NOW()`로만 쓴다**(`last_seen_at` 삭제 유예 15분). Go `time.Now()`와 섞으면 앱/DB 시간대 차이로 판정이 틀어진다. 표시용 시각은 Go 시간이어도 된다.
-- **JOIN 쿼리에서는 `XxxTableColumns`(테이블 한정 컬럼)를 쓴다.** `XxxColumns`는 비한정이라 `no`/`name`/`created_at`이 겹치면 ambiguous 에러. where 헬퍼는 생성 코드가 이미 한정한다.
+- **sqlboiler에서 JOIN + `qm.Select` 조합 금지.** JOIN이 있으면 sqlboiler가 select 컬럼을 `` `t`.`col` as "t.col" ``로 별칭 처리해서 구조체 필드에 바인딩되지 않는다(에러 없이 0/빈 값). 다른 테이블 조건은 서브쿼리 `qm.Where("x_no IN (SELECT no FROM ... WHERE ...)")`로 건다(`store.MCP`의 `serverApproval`). JOIN이 꼭 필요하면 `qm.Select` 없이 `t.*`로 받는다.
 - 목록 조회는 `qm.Select`로 `embedding`을 제외한다(수십 KB).
 - 이름 컬럼(`name`, `url`)은 `utf8mb4_bin` — MCP tool 이름은 대소문자를 구분한다.
 
