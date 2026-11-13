@@ -128,7 +128,10 @@ failCheck → authenticate → clearFail → PutUser → issueToken → fillLast
 - YAML의 `${ENV_VAR}` 치환 값: `JWT_SECRET_KEY`, `MYSQL_USER`/`MYSQL_PASSWORD`(anxer, anxer_ro), `DATAMAX_MYSQL_USER`/`DATAMAX_MYSQL_PASSWORD`(datamax).
 - **MySQL 3개**: `datamax`(사내 인사 DB, 외부 호스트, **읽기 전용**), `anxer`(쓰기, `user_login_log`), `anxer_ro`(읽기, 로그인 이력 조회).
 - **Redis**: `cache`(Valkey, TLS). 키 3종(`token_session`/`user_session`/`user_fail`)은 YAML에 정의.
-- **DynamoDB**: `aws.ap-northeast-2.dynamodb.table`(필수, 없으면 부팅 `log.Fatal`). 현재 값은 `aidea-session`(local/dev/live **공용 테이블 1개**).  local은 `profile: aidea`. 테이블: PK `id`(String, 정렬 키 없음), TTL 속성 `expires_at`, on-demand 권장.
+- **DynamoDB**: `aws.ap-northeast-2.dynamodb.table`(필수, 없으면 부팅 `log.Fatal`). 현재 값은 `aidea-session`(local/dev/live **공용 테이블 1개**). local은 `profile: aidea`. 테이블: PK `id`(String, 정렬 키 없음), TTL 속성 `expires_at`, on-demand.
+  - **생성 현황**: `aidea-session`을 `--profile aidea`로 계정 `897722678530` / `ap-northeast-2`에 생성했다(ACTIVE, TTL 활성). `sessions.DynamoDB`의 저장/조회/만료 거부/삭제는 이 테이블로 한 번 검증했다.
+  - **계정 주의**: 서비스가 실제로 도는 AWS 계정은 확인하지 못했다. spinx 설정의 `assume_role`은 다른 계정(`288891836008`)을 가리킨다. 서비스 계정이 다르면 그 계정에 테이블을 만들거나 교차 계정 접근이 필요하다.
+  - **IAM**: 서비스 실행 역할에 테이블 ARN 기준 `dynamodb:GetItem`/`PutItem`/`DeleteItem` 필요.
 - 로그: 에러 로그 + 커스텀 `auth` 파일 로그(`logs/%Y%m%d_%IP%_auth.log`). 파일 로그 포맷은 `시각(yyyyMMddHHmmss) 구분(L|R) company userNo status` 순서의 구분자 행.
 - 타임아웃(`timeout.read/write/idle`), `shutdown_timeout`, `cors` 목록은 YAML. graceful shutdown은 `shutdown_timeout-15`초 컨텍스트 + 10초 대기 후 `config.Close()`.
 
@@ -167,7 +170,10 @@ go build ./...    # 커밋 전 필수
 go vet ./... && gofmt -l .
 ```
 
-- 현재 테스트: `errors/handler_test.go`(에러 → 상태코드), `service/session_test.go`(세션 쓰기/삭제 순서, miniredis). 외부 의존 없음. 기능 추가/버그 수정 시 테스트를 함께 추가한다. 외부(Redis/MySQL/datamax) 의존이 크므로 `aidea-api-spinx`처럼 통합 테스트(`service` 레벨, store 경로까지 커버) + `hexim.LoadEnv()`가 현실적이다.
+- 현재 테스트: `errors/handler_test.go`(에러 → 상태코드), `service/session_test.go`(세션 쓰기/삭제 순서). 외부 의존 없음.
+- **세션 테스트는 `miniredis`(메모리 가짜 Redis)를 쓴다 — 의도된 예외.** 이 레포/`common`의 기존 Redis 테스트(`caches/redis_test.go`)와 spinx 관례는 dev Valkey에 직접 붙는 통합 테스트(mock 없음)지만, 세션 복구 로직은 키 존재/TTL/"있는 키는 덮어쓰지 않음"을 검증해야 하고 "Redis 장애 시에도 로그인 성공" 같은 장애 케이스는 실제 Redis로 재현하기 어렵다. 운영 코드는 기존 `configs.RedisConfig`/`caches`를 그대로 쓰며 `miniredis`는 `_test.go`에서만 import한다(`common`의 `middlewares/session_test.go`, auth의 `service/session_test.go`). 저장소(DynamoDB)는 가짜 구현(`fakeStore`)으로 대체한다.
+  - `go.mod`에 `miniredis`가 `// indirect`로 표기돼 있지만 실제로는 테스트가 직접 쓰는 의존성이다(`gopher-lua`가 함께 들어옴). `go mod tidy` 시 정리된다.
+  - 새 Redis 테스트는 기존 관례(실제 Valkey, `:test` suffix 키)를 우선하고, 장애/TTL 검증처럼 실제 Redis로 어려운 경우에만 `miniredis`를 쓴다. 기능 추가/버그 수정 시 테스트를 함께 추가한다. 외부(Redis/MySQL/datamax) 의존이 크므로 `aidea-api-spinx`처럼 통합 테스트(`service` 레벨, store 경로까지 커버) + `hexim.LoadEnv()`가 현실적이다.
 - **Dockerfile**: 멀티스테이지, `BUILD_TAG`(live는 `-tags production`), `config/*.yaml`·`openapi.yaml` 복사, `dumb-init` 엔트리포인트(prefork).
 - **Jenkinsfile**: 병렬 아치 빌드 → Harbor(`aidea/aidea-api-auth`) → manifest → `argocd-apps` 이미지 태그 갱신. `argocd-apps/aidea/aidea-api-auth/{base,dev,stg,live}`(kustomize, live는 Rollout/HPA/PDB 패치).
 
