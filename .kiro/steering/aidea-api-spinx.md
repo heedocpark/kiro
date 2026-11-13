@@ -109,6 +109,8 @@ CJ MezzoMedia AI 챗봇 **앤써(AnXer)**의 외부 연동 API 게이트웨이. 
 
 > **핸들러는 큐잉만, 전환은 배치가 한다.** `/spinx/mcp/:id/review`는 상태를 `requested`로만 올리고 끝낸다. 상태가 곧 큐이므로 배치 재시작/배포에도 유실 없이 다음 주기에 다시 집힌다.
 
+**global connection(`app_no=-1`)**: 모든 앱이 읽기/채팅 사용만 하고, 등록·수정·tool 선택·심사 요청은 관리자 `/mcp/global`에서만 한다(service 메서드를 `service.GlobalApp()` 주체로 호출 — 별도 로직 없음). 앱 쓰기 경로는 `ownConnection`(app.No만)이라 global을 못 건드린다. 앱 응답에서 남의 connection(global)은 `redactForeign`으로 `headers`/`notify_email`을 가린다.
+
 **앱 API의 `:server_id`는 connection id**, 관리자 API(`/mcp/:server_id`)는 server id다. 채팅 요청의 `mcp.servers[].id`(connection id)는 `filterMCPServers`로 앱 자신 + global의 사용 가능한 connection만 허용한다(다른 앱 토큰 사용 방지). 승인 후 URL 변경은 불가(새로 등록), 헤더(토큰)는 자유 수정.
 
 ## 테스트
