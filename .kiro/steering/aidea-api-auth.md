@@ -81,10 +81,18 @@ failCheck → authenticate → clearFail → PutUser → issueToken → fillLast
 ### 세션 / 토큰 구조
 
 - **JWT 클레임**: `id`(= sessionId, uuid), `no`, `company`, `role[]`, `exp`, `iat`. HS256, 키는 `jwt.key`(`${JWT_SECRET_KEY}`).
-- **두 개의 Redis 키**(`redis.cache.key`, 환경별 suffix `session:dev` 등):
-  - `token_session` — 토큰 1개당 1키. 로그아웃/갱신 시 삭제 → **서명이 유효해도 이 키가 없으면 인증 실패**(서버측 폐기).
-  - `user_session` — 사용자당 1키(`company`+`no`). 인증 후 `c.Locals("User")`로 꺼내는 사용자 정보.
-  - `user_fail` — 로그인 실패 카운터. TTL = `jwt.exp`.
+- **세션은 DynamoDB(원본) + Redis(캐시) 이중 저장**이다. 키 = JWT `id` 클레임(session id).
+  - **DynamoDB** (`aws.ap-northeast-2.dynamodb.table`) — 토큰 세션의 원본. 아이템: `id`(PK) / `data`(Session JSON: `company`, `no`, `role`, `user` 스냅샷) / `expires_at`(epoch초, **테이블 TTL 속성**). 코드: `aidea-api-common/sessions`.
+  - **Redis 키**(`redis.cache.key`, 환경별 suffix `session:dev` 등):
+    - `token_session` — 토큰 1개당 1키, 값 `{"company","no","role"}`. 로그아웃/갱신 시 삭제 → **서명이 유효해도 세션이 없으면 인증 실패**(서버측 폐기).
+    - `user_session` — 사용자당 1키(`company`+`no`). 인증 후 `c.Locals("User")`로 꺼내는 사용자 정보.
+    - `user_fail` — 로그인 실패 카운터. TTL = `jwt.exp`. (Redis 전용)
+  - **쓰기**: DynamoDB 먼저 → Redis. DynamoDB 실패 = 로그인 실패. Redis 실패는 경고만(미들웨어가 복구).
+  - **삭제**: DynamoDB 먼저 → Redis. DynamoDB 삭제 실패 = 에러(Redis만 지우면 저장소에서 되살아난다). 순서를 바꾸지 않는다.
+  - **복구**: `AuthenticationWithStore`(common)가 Redis에서 `token_session`/`user_session`이 없으면 DynamoDB에서 읽어 **없는 키만** 채운다(남은 TTL = `expires_at - now`). 토큰 클레임(`no`, `company`)과 저장 세션이 다르면 거부. DynamoDB 장애는 fail-closed(401). 저장소에도 없으면 30초짜리 부정 캐시(`<token_session키>:none`)로 폐기 토큰의 반복 조회를 막는다.
+  - `user_session`을 복구할 수 있는 이유: 세션 아이템에 사용자 스냅샷(`sessions.User`: no/id/name/email/team/department/company)이 같이 들어 있다. 토큰·마지막 로그인 정보는 넣지 않는다. 스냅샷은 발급 시점 값이다.
+  - **다른 서비스는 `Authentication`(Redis만) 그대로**라 Redis가 유실되면 여전히 실패한다. 보호하려면 해당 서비스가 `AuthenticationWithStore` + `aws.dynamodb` 설정 + IAM(`dynamodb:GetItem`/`PutItem`/`DeleteItem`)을 갖춰야 한다. 읽기 전용 서비스는 `PutItem` 불필요.
+- 세션 TTL(Redis, DynamoDB `expires_at`)은 모두 `jwt.exp`다. DynamoDB TTL 삭제는 지연될 수 있어 읽을 때 `expires_at`을 직접 검사한다.
 - **`jwt.exp`는 환경별로 크게 다르다**: local `31536000s`(1년), dev `7200s`, live `1800s`(30분). 실패 카운터 TTL도 `jwt.exp`를 재사용하므로 live에서 "30분 후 재시도" 문구와 맞는다. exp를 바꾸면 **잠금 해제 시간도 같이 바뀐다.**
 - **`RoleApi` 토큰은 Redis 세션을 보지 않는다.** `Authentication` 미들웨어는 토큰 역할에 `API`가 있으면 `token_session`/`user_session` 조회 없이 통과시킨다(`c.Locals("Role")`만 설정, `User` 없음). 즉 `API` 토큰 핸들러에서는 `c.Locals("User")`가 없다.
 
@@ -119,6 +127,7 @@ failCheck → authenticate → clearFail → PutUser → issueToken → fillLast
 - YAML의 `${ENV_VAR}` 치환 값: `JWT_SECRET_KEY`, `MYSQL_USER`/`MYSQL_PASSWORD`(anxer, anxer_ro), `DATAMAX_MYSQL_USER`/`DATAMAX_MYSQL_PASSWORD`(datamax).
 - **MySQL 3개**: `datamax`(사내 인사 DB, 외부 호스트, **읽기 전용**), `anxer`(쓰기, `user_login_log`), `anxer_ro`(읽기, 로그인 이력 조회).
 - **Redis**: `cache`(Valkey, TLS). 키 3종(`token_session`/`user_session`/`user_fail`)은 YAML에 정의.
+- **DynamoDB**: `aws.ap-northeast-2.dynamodb.table`(필수, 없으면 부팅 `log.Fatal`). 현재 값 `anxer-session-dev`(local/dev), `anxer-session-live`는 **임시 이름**이며 테이블은 직접 만들어야 한다. local은 `profile: aidea`. 테이블: PK `id`(String), TTL 속성 `expires_at`, on-demand 권장.
 - 로그: 에러 로그 + 커스텀 `auth` 파일 로그(`logs/%Y%m%d_%IP%_auth.log`). 파일 로그 포맷은 `시각(yyyyMMddHHmmss) 구분(L|R) company userNo status` 순서의 구분자 행.
 - 타임아웃(`timeout.read/write/idle`), `shutdown_timeout`, `cors` 목록은 YAML. graceful shutdown은 `shutdown_timeout-15`초 컨텍스트 + 10초 대기 후 `config.Close()`.
 
@@ -128,7 +137,7 @@ failCheck → authenticate → clearFail → PutUser → issueToken → fillLast
 - `main.go`는 `config = cfg.Get()` 패키지 var와 `init()`(GOMAXPROCS)을 쓴다.
 - 인증 미들웨어(`middlewares.Authentication`)는 `router/index.go`에서 config로 직접 만든다(main 주입 아님).
 - `.env`, `go.work`, `sqlboiler*.toml`은 gitignore 대상(로컬 전용)이다. `logs/`는 `*.log`만 무시된다.
-- 테스트는 `errors/handler_test.go`(에러 → 상태코드)뿐이다. 서비스 로직은 아직 없다.
+- 테스트는 `errors`/`service.Session`만 있다. 로그인 파이프라인(`service.Auth`)과 store 테스트는 아직 없다.
 
 ## 알려진 주의점 (작업 시 확인)
 
@@ -157,7 +166,7 @@ go build ./...    # 커밋 전 필수
 go vet ./... && gofmt -l .
 ```
 
-- 현재 테스트는 `errors/handler_test.go`뿐이다(외부 의존 없음, `app.Test`). 기능 추가/버그 수정 시 테스트를 함께 추가한다. 외부(Redis/MySQL/datamax) 의존이 크므로 `aidea-api-spinx`처럼 통합 테스트(`service` 레벨, store 경로까지 커버) + `hexim.LoadEnv()`가 현실적이다.
+- 현재 테스트: `errors/handler_test.go`(에러 → 상태코드), `service/session_test.go`(세션 쓰기/삭제 순서, miniredis). 외부 의존 없음. 기능 추가/버그 수정 시 테스트를 함께 추가한다. 외부(Redis/MySQL/datamax) 의존이 크므로 `aidea-api-spinx`처럼 통합 테스트(`service` 레벨, store 경로까지 커버) + `hexim.LoadEnv()`가 현실적이다.
 - **Dockerfile**: 멀티스테이지, `BUILD_TAG`(live는 `-tags production`), `config/*.yaml`·`openapi.yaml` 복사, `dumb-init` 엔트리포인트(prefork).
 - **Jenkinsfile**: 병렬 아치 빌드 → Harbor(`aidea/aidea-api-auth`) → manifest → `argocd-apps` 이미지 태그 갱신. `argocd-apps/aidea/aidea-api-auth/{base,dev,stg,live}`(kustomize, live는 Rollout/HPA/PDB 패치).
 
@@ -167,6 +176,7 @@ go vet ./... && gofmt -l .
 - 새 엔드포인트 → 해당 `router/<group>`에 `(a *api)` 메서드 추가, 로직은 `service`. 인증 범위(`AccessRole`/`ADMIN`/`API`)를 먼저 정하고 **openapi.yaml도 같이 갱신**한다.
 - 새 의존성 → 생성자 인자로 추가하고 `main.go`에서 주입.
 - 로그인 정책(잠금 횟수/해제 시간/비밀번호 검증) → `service/auth.go`의 `failCheck`/`authenticate`, `service/session.go`의 실패 카운터. TTL이 `jwt.exp`에 묶여 있음을 기억한다.
+- 세션 저장/복구 로직 → `service/session.go`(쓰기·삭제 순서), `aidea-api-common/middlewares/session.go`(복구), `aidea-api-common/sessions`(저장소). 테스트: `service/session_test.go`, `middlewares/session_test.go`(miniredis + 가짜 저장소).
 - 토큰/세션 구조 변경 → `Auth.issueToken`, `Session.PutToken`, `aidea-api-common`의 `Authentication`·`JwtService`를 함께 본다. 다른 모든 서비스가 영향받는다.
 - 사용자 조회 쿼리 변경 → `store/user.go`(로그인 raw SQL, `Get`, `Search`) + `database/datamax/user.go` 변환 헬퍼.
 - 새 에러 → `errors/index.go`에 상수 추가. 인증 계열이면 `Handler()`의 로그 제외 `switch`에도 코드를 넣는다.
