@@ -111,7 +111,7 @@ failCheck → authenticate → clearFail → PutUser → issueToken → fillLast
 - 코드는 `XXXYY` 5자리(HTTP 상태 = `code/100`). `code < 10000`이면 `*100` 보정.
 - 응답 형식: `{id, code, message}` (go-conventions의 `{id, message, detail}`과 **다르다**. 이 서비스 `Handler()` 기준).
 - **인증 관련 코드(40100~40103)는 로깅하지 않는다.** 그 외는 `zap` Error로 요청 id/ip/method/path/query/body(+user_no) 필드와 함께 남긴다. multipart는 body 대신 content-type만.
-- 사용자 입력 오류와 사용자 없음을 **같은 `UserIdNotFound`로 뭉쳐서** 반환한다(계정 존재 여부 노출 최소화 의도). `userLogin`에서 쿼리 에러·ErrNoRows 모두 `UserIdNotFound`로 감싼다.
+- 사용자 입력 오류와 사용자 없음을 **같은 `UserIdNotFound`로 뭉쳐서** 반환한다(계정 존재 여부 노출 최소화 의도). `service.User.credential`에서 쿼리 에러·ErrNoRows 모두 `UserIdNotFound`로 감싼다.
 
 ## 설정 / 환경
 
