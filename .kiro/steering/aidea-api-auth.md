@@ -63,7 +63,7 @@ CJ MezzoMedia AI 챗봇 **앤써(AnXer)**의 인증 서비스. 사내 인사 DB(
 `service.Auth.Login`은 `step` 파이프라인을 순서대로 실행하고 **첫 에러에서 중단**한다.
 
 ```
-failCheck → userLogin → clearFailCount → userPut → makeToken → lastLoginHistory
+failCheck → authenticate → clearFail → PutUser → issueToken → fillLastLogin
 ```
 
 - **`failCheck`** — Redis `user_fail` 카운터가 **2 초과(= 3회 실패)면** `TooManyFailedLogin`.
