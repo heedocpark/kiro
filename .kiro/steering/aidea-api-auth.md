@@ -81,12 +81,13 @@ failCheck → authenticate → clearFail → PutUser → issueToken → fillLast
 ### 세션 / 토큰 구조
 
 - **JWT 클레임**: `id`(= sessionId, uuid), `no`, `company`, `role[]`, `exp`, `iat`. HS256, 키는 `jwt.key`(`${JWT_SECRET_KEY}`).
-- **세션은 DynamoDB(원본) + Redis(캐시) 이중 저장**이다. 키 = JWT `id` 클레임(session id).
-  - **DynamoDB** (`aws.ap-northeast-2.dynamodb.table`) — 토큰 세션의 원본. 아이템: `id`(PK) / `data`(Session JSON: `company`, `no`, `role`, `user` 스냅샷) / `expires_at`(epoch초, **테이블 TTL 속성**). 코드: `aidea-api-common/sessions`.
+- **세션은 DynamoDB(원본) + Redis(캐시) 이중 저장**이다. 저장소 키 = **Redis `token_session` 키 그대로**(예: dev `token:<sessionId>:session:dev`, live `token:<sessionId>:session`).
+  - **DynamoDB** (`aws.ap-northeast-2.dynamodb.table`) — 토큰 세션의 원본. 아이템: `id`(PK, 값은 위 Redis 키) / `data`(Session JSON: `company`, `no`, `role`, `user` 스냅샷) / `expires_at`(epoch초, **테이블 TTL 속성**). 코드: `aidea-api-common/sessions`.
   - **Redis 키**(`redis.cache.key`, 환경별 suffix `session:dev` 등):
     - `token_session` — 토큰 1개당 1키, 값 `{"company","no","role"}`. 로그아웃/갱신 시 삭제 → **서명이 유효해도 세션이 없으면 인증 실패**(서버측 폐기).
     - `user_session` — 사용자당 1키(`company`+`no`). 인증 후 `c.Locals("User")`로 꺼내는 사용자 정보.
     - `user_fail` — 로그인 실패 카운터. TTL = `jwt.exp`. (Redis 전용)
+  - **dev/live 공용 테이블**: 환경별 Redis 키 suffix(`session:dev` vs `session`)가 PK에 들어 있어 충돌하지 않는다. 이 suffix를 환경 간에 같게 바꾸면 세션이 섞이므로 바꾸지 않는다. 키 앞부분이 `token:`으로 같아서 IAM `dynamodb:LeadingKeys`로는 환경을 나눌 수 없다(dev 역할이 live 세션에 접근 가능) — 분리가 필요하면 테이블을 나눈다.
   - **쓰기**: DynamoDB 먼저 → Redis. DynamoDB 실패 = 로그인 실패. Redis 실패는 경고만(미들웨어가 복구).
   - **삭제**: DynamoDB 먼저 → Redis. DynamoDB 삭제 실패 = 에러(Redis만 지우면 저장소에서 되살아난다). 순서를 바꾸지 않는다.
   - **복구**: `AuthenticationWithStore`(common)가 Redis에서 `token_session`/`user_session`이 없으면 DynamoDB에서 읽어 **없는 키만** 채운다(남은 TTL = `expires_at - now`). 토큰 클레임(`no`, `company`)과 저장 세션이 다르면 거부. DynamoDB 장애는 fail-closed(401). 저장소에도 없으면 30초짜리 부정 캐시(`<token_session키>:none`)로 폐기 토큰의 반복 조회를 막는다.
@@ -127,7 +128,7 @@ failCheck → authenticate → clearFail → PutUser → issueToken → fillLast
 - YAML의 `${ENV_VAR}` 치환 값: `JWT_SECRET_KEY`, `MYSQL_USER`/`MYSQL_PASSWORD`(anxer, anxer_ro), `DATAMAX_MYSQL_USER`/`DATAMAX_MYSQL_PASSWORD`(datamax).
 - **MySQL 3개**: `datamax`(사내 인사 DB, 외부 호스트, **읽기 전용**), `anxer`(쓰기, `user_login_log`), `anxer_ro`(읽기, 로그인 이력 조회).
 - **Redis**: `cache`(Valkey, TLS). 키 3종(`token_session`/`user_session`/`user_fail`)은 YAML에 정의.
-- **DynamoDB**: `aws.ap-northeast-2.dynamodb.table`(필수, 없으면 부팅 `log.Fatal`). 현재 값 `anxer-session-dev`(local/dev), `anxer-session-live`는 **임시 이름**이며 테이블은 직접 만들어야 한다. local은 `profile: aidea`. 테이블: PK `id`(String), TTL 속성 `expires_at`, on-demand 권장.
+- **DynamoDB**: `aws.ap-northeast-2.dynamodb.table`(필수, 없으면 부팅 `log.Fatal`). 현재 값은 `aidea-session`(local/dev/live **공용 테이블 1개**).  local은 `profile: aidea`. 테이블: PK `id`(String, 정렬 키 없음), TTL 속성 `expires_at`, on-demand 권장.
 - 로그: 에러 로그 + 커스텀 `auth` 파일 로그(`logs/%Y%m%d_%IP%_auth.log`). 파일 로그 포맷은 `시각(yyyyMMddHHmmss) 구분(L|R) company userNo status` 순서의 구분자 행.
 - 타임아웃(`timeout.read/write/idle`), `shutdown_timeout`, `cors` 목록은 YAML. graceful shutdown은 `shutdown_timeout-15`초 컨텍스트 + 10초 대기 후 `config.Close()`.
 
