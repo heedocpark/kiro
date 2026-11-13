@@ -128,7 +128,7 @@ failCheck → authenticate → clearFail → PutUser → issueToken → fillLast
 - `main.go`는 `config = cfg.Get()` 패키지 var와 `init()`(GOMAXPROCS)을 쓴다.
 - 인증 미들웨어(`middlewares.Authentication`)는 `router/index.go`에서 config로 직접 만든다(main 주입 아님).
 - `.env`, `go.work`, `sqlboiler*.toml`은 gitignore 대상(로컬 전용)이다. `logs/`는 `*.log`만 무시된다.
-- 테스트가 없다.
+- 테스트는 `errors/handler_test.go`(에러 → 상태코드)뿐이다. 서비스 로직은 아직 없다.
 
 ## 알려진 주의점 (작업 시 확인)
 
@@ -137,7 +137,7 @@ failCheck → authenticate → clearFail → PutUser → issueToken → fillLast
 - **로컬은 비밀번호 검증이 꺼져 있다**(`IsLocal`). 로컬 동작을 근거로 live 로그인 동작을 판단하지 않는다.
 - `GetIncr`는 Redis 에러를 0으로 삼킨다 → Redis 장애 시 실패 잠금이 **열린 채로(fail-open)** 동작한다.
 - `search`는 결과가 없으면 `nil`을 반환해 **200 + 빈 본문**이 된다(204 아님, `openapi.yaml`과 맞는지 확인). 단건 조회(`Get`)와 달리 `status = 1` 조건이 **없어** 비활성 사용자도 검색된다(기존 동작 유지).
-- **인증 실패 응답 상태코드가 200이다(기존 동작).** 토큰 없이 보호 라우트를 호출하면 미들웨어가 `message: "unknown error"`, `code: 0`인 에러를 반환하고, `errors.Handler()`가 `code < 10000 → *100`을 거쳐 `Status(0)`(= 200)으로 응답한다. 핸들러는 실행되지 않으므로 우회는 아니지만 상태코드가 틀리다. `common`의 `Authentication`(`er.Wrap(authError, WithError(nil))`)과 `Handler()` 쪽을 함께 확인한다.
+- **`er.WithError(err)`는 쓰지 않는다(deprecated).** 래핑 대상을 `err`로 **교체**해 원래 에러의 code/message가 사라진다. 과거 `common`의 `Authentication`이 `er.Wrap(authError, er.WithError(err))`로 401이 아니라 code 0 → `Status(0)` → HTTP 200으로 응답하던 버그가 있었다(수정 완료). 원인 에러는 `er.WithKeyValue("cause", ...)`로 남긴다. 이 서비스 `Handler()`는 코드 없는 에러(code 0)를 500(50000)으로 내린다.
 - 사용자 `like` 검색은 `"%"+입력+"%"` 파라미터 바인딩이라 SQL 인젝션은 아니지만, 인덱스를 타지 않는 전체 스캔이다. datamax는 외부 DB이므로 호출 빈도에 유의한다.
 - `sqlboiler.toml`/`sqlboiler_datamax.toml`은 DB 접속 정보를 담는다. 값을 문서/로그/응답에 옮기지 않는다. 두 파일은 gitignore(`sqlboiler*.toml`) 대상이라 저장소엔 없고 로컬에만 있다(현재 `sqlboiler.toml`에 평문 자격 증명이 있으니 로컬 보관만 하고 공유하지 않는다).
 
@@ -157,7 +157,7 @@ go build ./...    # 커밋 전 필수
 go vet ./... && gofmt -l .
 ```
 
-- 레포에 `*_test.go`가 **없다.** 기능 추가/버그 수정 시 테스트를 함께 추가한다. 외부(Redis/MySQL/datamax) 의존이 크므로 `aidea-api-spinx`처럼 통합 테스트(`service` 레벨, store 경로까지 커버) + `hexim.LoadEnv()`가 현실적이다.
+- 현재 테스트는 `errors/handler_test.go`뿐이다(외부 의존 없음, `app.Test`). 기능 추가/버그 수정 시 테스트를 함께 추가한다. 외부(Redis/MySQL/datamax) 의존이 크므로 `aidea-api-spinx`처럼 통합 테스트(`service` 레벨, store 경로까지 커버) + `hexim.LoadEnv()`가 현실적이다.
 - **Dockerfile**: 멀티스테이지, `BUILD_TAG`(live는 `-tags production`), `config/*.yaml`·`openapi.yaml` 복사, `dumb-init` 엔트리포인트(prefork).
 - **Jenkinsfile**: 병렬 아치 빌드 → Harbor(`aidea/aidea-api-auth`) → manifest → `argocd-apps` 이미지 태그 갱신. `argocd-apps/aidea/aidea-api-auth/{base,dev,stg,live}`(kustomize, live는 Rollout/HPA/PDB 패치).
 
