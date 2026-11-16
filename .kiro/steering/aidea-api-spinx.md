@@ -135,5 +135,6 @@ CJ MezzoMedia AI 챗봇 **앤써(AnXer)**의 외부 연동 API 게이트웨이. 
 - hexim `Usage.InputToken`은 캐시 제외 값이다. spinx도 **`tokens`/`input_tokens`는 캐시 제외**, 캐시는 `cache_read_tokens`/`cache_write_tokens` 별도 컬럼에 저장한다(`spinx_message`·`spinx_session`·`spinx_daily_stat`). 집계 시 `tokens`에 캐시를 다시 더하지 않는다.
 - user 메시지 행에 input + 캐시 read/write, assistant 행에 output만 넣는다(`router/spinx/index.go` chat/stream, `service/session.go` 요약 공통).
 - Redis 일일 한도(`AddDailyUsageToken`)는 `InputToken + OutputToken`(캐시 제외).
-- `anxer-tools`는 전역 `ToolStore`의 `*llm.Tool`을 **복사해서** 요청별 `Headers`/`Cache`를 넣는다(공유 객체 직접 수정 금지 — 동시 요청 간 headers 혼입).
-- 요청의 `Content.Cache`/`Tool.Cache`는 `*llm.Request` 바인딩으로 hexim까지 그대로 전달된다. 사용 규칙은 `openapi.yaml` `chat_request`에 문서화.
+- `anxer-tools`는 전역 `ToolStore`의 `*llm.Tool`을 **복사해서** 요청별 `Headers`를 넣는다(공유 객체 직접 수정 금지 — 동시 요청 간 headers 혼입).
+- 프롬프트 캐시는 요청의 `{"type":"cache"}` 마커(Content/Tool 목록)와 `{"role":"cache"}` 메시지로 지정하며, `*llm.Request` 바인딩으로 hexim까지 그대로 전달돼 변환 단계에서 처리된다(`Tool.Cache`/`Content.Cache` 필드는 없다). 요청의 도구는 `llm.Tools`(슬라이스, 넣은 순서 그대로 전달)이고 `tool_use` 목록의 마커는 `index.go`의 `switch t.Type` `default` 분기로 지나간다. 사용 규칙은 `openapi.yaml` `chat_request`(`messages[].role`/`content[].ttl`/`tool_use[].ttl`)에 문서화.
+- `llm.Tools`가 슬라이스라서 이름 키 접근이 없다: `store.MCP.SyncTools`는 `tool.Name`으로 순회, MCP 도구 매핑은 `mapping.Add(...)`(`make(llm.Tools, 0, n)`). 배포는 **spinx를 agent보다 먼저**(구버전 spinx는 `role: cache` 메시지를 빈 user 메시지로 처리해 Anthropic 400 가능).

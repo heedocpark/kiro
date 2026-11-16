@@ -56,12 +56,15 @@ fileMatchPattern: 'aidea-api-agent/{agent,cmd/workflow,cmd/agent,router/agent}/*
 
 6. **`validatePlan`은 빈 task/goal을 모아서 한 번에 거부** — 재시도 때 모델이 전부 한 번에 고치도록. (단, 1번처럼 response_format이 원인이면 재시도로도 안 고쳐짐 → response_format 제거가 근본 해법. 프롬프트/피드백 강화만으로는 구조적 원인을 못 이긴다.)
 
-## 프롬프트 캐시 배치 (`llm.WithCache`)
+## 프롬프트 캐시 배치 (`llm.NewCache`)
 - 원칙: breakpoint는 **요청 간 동일한 구간의 마지막 블록**에만 건다. 그 앞 전체(tools → system → messages)가 캐시되고, 바뀌는 내용(`request`/`upstreams`/`fail_reasons`/`result`/`subtask_results`)은 반드시 뒤에 둔다. 최대 4개.
-- 현재 배치 (5m):
-  - **worker** `messages`: `user_instructions`(system+사용자 지시 — 같은 실행의 모든 subtask·실행 간 공유), `goal`(subtask 재시도)
-  - **verifier** `messages`: `system`(모든 subtask 검증 공유), `goal`(검증 재시도)
-  - **chat** `Stream`: `user_instructions`(대화 간 공유)
+- 지정 방법: 메시지 목록에 `msgs = append(msgs, llm.NewCache())`를 끼우면 hexim이 **바로 앞 메시지** 끝의 마커로 합친다. 맨 앞에 두면 에러, 연속 두 번도 에러. `WithCache` 옵션은 제거됐다(`58c23fe`). spinx로 가는 JSON은 `{"role":"cache","content":[{"type":"cache"}]}`.
+- 현재 배치 (5m, 마커 2개씩):
+  - **worker** `messages`: `system`+`user_instructions`(`<user_instructions>` 태그의 system 메시지) 뒤 — 같은 실행의 모든 subtask·실행 간 공유. `task`/`goal`/`request`/`upstreams` 뒤 — subtask의 재시도(turn, 내부 attempt)에서 재사용. `fail_reasons`는 마지막 마커 뒤라 캐시 밖.
+  - **verifier** `messages`: `system` 뒤(모든 subtask 검증 공유), `result` 직전(`task`/`goal`/`request`/`upstreams`까지 — 같은 subtask를 verifier가 거절해 worker가 재시도한 뒤 다시 검증할 때 재사용). `result`는 마커 뒤.
+  - **chat** `Stream`: `system`+`user_instructions` 뒤(대화 간 공유)
+  - 두 번째 마커는 재시도율이 약 28%를 넘어야 손해가 없다(write 1.25x / read 0.1x 기준). 통과율이 높은 verifier는 `CacheReadToken`/`CacheWriteToken`으로 적중률을 보고 유지 여부를 정한다.
+  - 테스트(`worker_test.go`/`verifier_test.go`)는 `helper_test.go`의 `contentMessages`(캐시 전용 메시지 제외 개수)와 `countCache`(마커 수)로 센다.
   - **orchestrator**: **캐시 없음**. Plan/Aggregate는 system prompt가 달라 서로 공유 안 되고 실행당 1회씩이라, 재시도가 없으면 write 할증(1.25x)만 남는다. 실측(2026-11-11)에서 orchestrator로 보이는 sonnet 호출 8건 모두 read 0 → 제거.
 - 실측 요약(같은 run): haiku(worker) 히트율 60%·입력비용 −53%, sonnet(verifier 등) 히트율 32%·−25%. verifier의 system read(6936)는 매 호출 적중, goal breakpoint도 재시도에서 실제 재사용 확인.
 - 남은 과제
